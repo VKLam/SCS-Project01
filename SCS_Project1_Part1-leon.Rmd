@@ -1,0 +1,604 @@
+---
+title: "SCS Project 1, Part 1 — Uncertainty in max flow and time to peak"
+subtitle: "Thames at Reading, 15-minute flow, Aug 1992 – Sep 2026. Reproducible analysis code."
+author: "Group: A (pipeline), B (max flow), C (time to peak)"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+<!--
+HOW THIS FILE IS ORGANISED
+==========================
+Section 0  Setup: packages, constants (every tuneable number lives here), paths.
+Section 1  Load the raw CSV and parse times.                            -> flow_raw
+Section 2  Clean: impossible values, keep quality flags.                -> flow
+Section 3  Gaps: find runs of NA, interpolate short ones only.          -> flow$flow
+Section 4  Smoothing: 3 h median for peaks, 24 h median for troughs.    -> flow_smooth, flow_day
+Section 5  EDA: full series, quality flags, seasonality, water-year maxima, distribution.
+Section 6  Event extraction with POT (Task 2): threshold scan, Robson & Reed
+           independence, start of peak, the EVENT TABLE, example-event figure.
+Section 7  Max flow (Task 3): MRL and stability plots, GPD fit, diagnostics, return levels.
+Section 8  Time to peak and joint behaviour (Task 4).
+Section 9  Sensitivity analysis (Task 5): one table.
+Section 10 Save outputs for Part 2; session info.
+
+All the POT machinery is in pot_functions.R (sourced in Section 0) so that the
+sensitivity analysis is a loop over extract_events(), not new code.
+
+Every chunk is named.  Comments explain WHY, because the report must justify
+every choice.  Nothing in the report is raw R output: each chunk ends with a
+figure or a tidy table that can be copied into the report.
+Knitting takes ~5 minutes (the 24 h rolling median and the sensitivity grid
+dominate).  Set run_sensitivity <- FALSE below while developing.
+-->
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.5)
+```
+
+# Setup
+
+```{r packages}
+library(zoo)       # na.approx (interpolation) and rollmedian (smoothing)
+library(ismev)     # mrl.plot, gpd.fitrange, gpd.fit, gpd.diag  (as in the lecture example)
+library(MASS)      # fitdistr for lognormal / gamma fits to time to peak
+source("pot_functions.R")   # extract_events(), event_hydrographs(), gpd_return_level()
+set.seed(2026)              # bootstrap CIs reproducible
+```
+
+```{r constants}
+## ---- All tuneable choices in one place -------------------------------------
+data_file   <- "Reading-flow-15min-Qualified.csv"   # relative path: CSV next to this Rmd
+step_min    <- 15                      # sampling interval, minutes
+per_day     <- 24 * 60 / step_min      # 96 readings per day
+
+## Cleaning
+max_gap_h   <- 4                       # interpolate NA runs up to this long (hours).
+                                       # At high flow (>80 m3/s) the river moves ~1% (median)
+                                       # and <8% (95th pct) over 4 h, and floods here take
+                                       # days to peak, so a straight line over <=4 h cannot
+                                       # materially change max flow or time to peak.
+max_gap_n   <- max_gap_h * 60 / step_min
+smooth_h    <- 3                       # rolling median for locating PEAKS (hours)
+day_h       <- 24                      # rolling median for locating TROUGHS (hours)
+hydro_start <- 10                      # hydrological year starts 1 October
+
+## Event extraction (defaults; the sensitivity grid varies them)
+u           <- 60                      # threshold, m3/s  -> about 3.5 events per year
+u_low       <- 40                      # lower threshold used only for MRL / stability plots
+sep_factor  <- 3                       # Robson & Reed: peaks >= 3 x mean time to rise apart
+trough_frac <- 1/3                     # ... and trough below 1/3 of the first peak
+start_rule  <- "trough"                # start of peak = last daily-scale trough before the peak
+win_h       <- 48                      # a trough is the lowest point within +/- win_h hours
+
+## Return periods to report, years
+ret_periods <- c(2, 10, 50, 100)
+
+run_sensitivity <- TRUE                # FALSE to skip Section 9 while developing
+```
+
+# Load the raw data
+
+```{r load}
+## EA "qualified" export: comma-separated, header row; we keep three columns.
+flow_raw <- read.csv(data_file, stringsAsFactors = FALSE)[, c("dateTime", "value", "quality")]
+
+## EA timestamps are GMT all year, so parse as UTC: no daylight-saving jump, and
+## differences between rows are exact multiples of 15 minutes.
+flow_raw$dateTime <- as.POSIXct(flow_raw$dateTime, format = "%Y-%m-%dT%H:%M:%S", tz = "UTC")
+flow_raw <- flow_raw[order(flow_raw$dateTime), ]
+
+## Sanity check that the grid is regular: everything that counts readings as
+## time (gaps, windows, separations) relies on it.
+steps   <- diff(as.numeric(flow_raw$dateTime)) / 60
+grid_ok <- mean(steps == step_min)
+years_of_record <- as.numeric(difftime(max(flow_raw$dateTime), min(flow_raw$dateTime),
+                                       units = "days")) / 365.25
+data.frame(first = format(min(flow_raw$dateTime)), last = format(max(flow_raw$dateTime)),
+           years = round(years_of_record, 1), n = nrow(flow_raw),
+           regular_grid = paste0(round(100 * grid_ok, 2), "%"))
+```
+
+# Clean
+
+```{r clean}
+flow <- flow_raw
+
+## 1. Impossible values: flow cannot be negative.  Six readings (min about -46)
+##    are recording errors -> NA.  `value` is otherwise untouched: every max flow
+##    in the project is read from `value`, never from a smoothed/interpolated series.
+n_negative <- sum(flow$value < 0, na.rm = TRUE)
+flow$value[!is.na(flow$value) & flow$value < 0] <- NA
+
+## 2. Quality flags are KEPT.  Suspect readings sit disproportionately in the big
+##    floods (about 10% of all readings above 100 m3/s; the Feb 2021 and Jan 2014
+##    peaks are Suspect).  Dropping them would bias max flow down and distort
+##    time to peak.  The flag is carried so each event can report how many
+##    flagged readings it contains, and Section 9 reruns without Suspect data.
+flow$quality <- factor(flow$quality,
+                       levels = c("Good", "Estimated", "Suspect", "Unchecked", "Missing"))
+
+## 3. Time helpers.  Hydrological year Oct-Sep, labelled by the year it ENDS, so
+##    each winter's floods fall in one year (calendar years split them at 31 Dec).
+flow$year       <- as.integer(format(flow$dateTime, "%Y"))
+flow$month      <- as.integer(format(flow$dateTime, "%m"))
+flow$hydro_year <- flow$year + as.integer(flow$month >= hydro_start)
+flow$season     <- ifelse(flow$month %in% c(10:12, 1:3), "winter (Oct-Mar)", "summer (Apr-Sep)")
+
+flag_tab <- as.data.frame(table(flag = flow$quality))
+flag_tab$percent <- round(100 * flag_tab$Freq / nrow(flow), 2)
+flag_tab
+cat("Negative readings set to NA:", n_negative, "\n")
+```
+
+# Gaps
+
+```{r gaps}
+## Runs of consecutive NA readings via rle().
+is_gap <- is.na(flow$value)
+r      <- rle(is_gap)
+ends   <- cumsum(r$lengths); starts <- ends - r$lengths + 1
+gaps   <- data.frame(start = starts[r$values], end = ends[r$values])
+gaps$n_readings <- gaps$end - gaps$start + 1
+gaps$hours      <- gaps$n_readings * step_min / 60
+gaps$from       <- flow$dateTime[gaps$start]
+gaps$to         <- flow$dateTime[gaps$end]
+gaps$filled     <- gaps$n_readings <= max_gap_n
+
+## Interpolate ONLY short gaps: straight line between the readings either side.
+## maxgap = 16 leaves any run of 17+ NAs untouched.  `flow` is used for peak
+## detection; max flow is still read from `value`.
+flow$flow <- na.approx(flow$value, maxgap = max_gap_n, na.rm = FALSE)
+
+gap_summary <- data.frame(
+  category   = c(paste0("gaps <= ", max_gap_h, " h (interpolated)"),
+                 paste0("gaps > ",  max_gap_h, " h (left missing)")),
+  n_gaps     = c(sum(gaps$filled), sum(!gaps$filled)),
+  n_readings = c(sum(gaps$n_readings[gaps$filled]), sum(gaps$n_readings[!gaps$filled])),
+  longest    = c(paste(max(gaps$hours[gaps$filled]), "h"),
+                 paste(round(max(gaps$hours[!gaps$filled]) / 24, 1), "days")))
+gap_summary
+cat("Missing before:", sum(is.na(flow$value)), " after:", sum(is.na(flow$flow)),
+    " (", round(100 * mean(is.na(flow$flow)), 2), "% of record )\n")
+
+## Long gaps listed individually: the 28-day gap from 9 Feb 2021 starts while
+## flow is ~190 m3/s, i.e. the recession of the 4th-largest flood is missing.
+long_gaps <- gaps[gaps$hours > 24, ]
+long_gaps$flow_before <- round(flow$value[pmax(long_gaps$start - 1, 1)])
+long_gaps$flow_after  <- round(flow$value[pmin(long_gaps$end + 1, nrow(flow))])
+long_gaps$days        <- round(long_gaps$hours / 24, 1)
+long_gaps[order(-long_gaps$days), c("from", "to", "days", "flow_before", "flow_after")]
+```
+
+# Smoothing for peak and trough detection
+
+```{r smooth}
+## Two smoothed series, both used ONLY to locate things in time:
+##  flow_smooth  3 h centred rolling median: removes 15-min jitter so a flat
+##               crest does not produce many tiny "local maxima".  Locates the peak.
+##  flow_day     24 h centred rolling median: locates troughs (start / end of an
+##               event).  Reading is weir-controlled and gate operations put
+##               6-hour steps and dips on a rising limb; at the daily scale these
+##               vanish, so the trough found is the real start of the rise.
+## Medians, not means, so a single odd reading cannot drag the curve.
+odd <- function(k) if (k %% 2 == 0) k + 1 else k
+flow$flow_smooth <- rollmedian(flow$flow, k = odd(smooth_h * 60 / step_min), fill = NA)
+flow$flow_day    <- rollmedian(flow$flow, k = odd(day_h    * 60 / step_min), fill = NA)
+
+## Save the clean series now (Part 2 needs it, and it lets Sections 6-9 be
+## developed from the .rds without re-running the slow steps above).
+flow_clean <- flow[, c("dateTime", "value", "flow", "flow_smooth", "flow_day", "quality",
+                       "hydro_year", "season", "year", "month")]
+saveRDS(flow_clean, "flow_clean.rds")
+
+## Visual check on the largest flood that smoothing does not move the peak.
+win <- flow$dateTime >= as.POSIXct("2002-12-20", tz = "UTC") &
+       flow$dateTime <= as.POSIXct("2003-01-15", tz = "UTC")
+plot(flow$dateTime[win], flow$value[win], type = "l", col = "grey60",
+     xlab = "Date", ylab = expression("Flow (m"^3*"/s)"),
+     main = "January 2003 flood: recorded (grey), 3 h median (blue), 24 h median (red)")
+lines(flow$dateTime[win], flow$flow_smooth[win], col = "steelblue", lwd = 2)
+lines(flow$dateTime[win], flow$flow_day[win],    col = "firebrick", lwd = 1.5, lty = 2)
+```
+
+# Exploratory data analysis
+
+## Full record and quality flags
+
+```{r eda-series, fig.height = 6}
+## Daily maxima keep every flood peak and make 34 years readable in one panel.
+flow$day  <- as.Date(flow$dateTime)
+daily_max <- aggregate(value ~ day, data = flow, FUN = max)
+
+par(mfrow = c(2, 1), mar = c(3, 4.5, 3, 1))
+plot(daily_max$day, daily_max$value, type = "l", lwd = 0.6,
+     xlab = "", ylab = expression("Daily max flow (m"^3*"/s)"),
+     main = "Thames at Reading, 1992-2026: daily maximum of 15-minute flow")
+abline(h = u, lty = 2, col = "firebrick")
+legend("topright", bty = "n", lty = 2, col = "firebrick", legend = paste("u =", u), cex = 0.8)
+
+## Timing of non-Good flags: the Suspect runs sit under the 2014 and 2021 floods,
+## which is the argument for keeping them.
+flagged <- flow[flow$quality != "Good", ]
+plot(flagged$dateTime, as.integer(flagged$quality), pch = "|", cex = 0.6, yaxt = "n",
+     ylim = c(1.5, 5.5), xlab = "", ylab = "", main = "Timing of non-Good quality flags",
+     col = c(NA, "darkorange", "firebrick", "purple", "grey40")[as.integer(flagged$quality)])
+axis(2, at = 2:5, labels = levels(flow$quality)[2:5], las = 1, cex.axis = 0.8)
+par(mfrow = c(1, 1))
+```
+
+```{r eda-flags-by-year}
+## Water years with more than 5% non-Good readings.
+fy <- round(as.data.frame.matrix(prop.table(table(flow$hydro_year, flow$quality), 1) * 100), 1)
+fy$hydro_year <- rownames(fy)
+fy[fy$Good < 95, c("hydro_year", "Good", "Estimated", "Suspect", "Unchecked", "Missing")]
+```
+
+## Seasonality
+
+```{r eda-season}
+## High flows are a winter phenomenon: Nov-Mar medians are 2-3x the summer ones.
+## Justifies the Oct-Sep water year and the winter/summer split in Section 8.
+boxplot(value ~ month, data = flow, outline = FALSE, names = month.abb,
+        col = ifelse(1:12 %in% c(10:12, 1:3), "lightsteelblue", "wheat"),
+        xlab = "Month", ylab = expression("Flow (m"^3*"/s)"),
+        main = "Flow by calendar month (outliers hidden)")
+legend("topright", bty = "n", fill = c("lightsteelblue", "wheat"),
+       legend = c("winter (Oct-Mar)", "summer (Apr-Sep)"))
+```
+
+## Hydrological-year maxima
+
+```{r eda-annual-max}
+## Annual maxima motivate POT (one value per year wastes multi-flood winters) and
+## give a crude look at trend.  The partial first water year (Aug-Sep 1992) is dropped.
+ann <- aggregate(value ~ hydro_year, data = flow, FUN = max)
+ann <- ann[ann$hydro_year > min(ann$hydro_year), ]
+plot(ann$hydro_year, ann$value, type = "b", pch = 19,
+     xlab = "Hydrological year (Oct-Sep, labelled by end year)",
+     ylab = expression("Annual maximum flow (m"^3*"/s)"),
+     main = "Annual maximum flow: large variability, no obvious trend")
+abline(lm(value ~ hydro_year, data = ann), lty = 3, col = "grey40")
+slope <- coef(lm(value ~ hydro_year, data = ann))[2]
+data.frame(n_years = nrow(ann), min = round(min(ann$value)), median = round(median(ann$value)),
+           max = round(max(ann$value)), year_of_max = ann$hydro_year[which.max(ann$value)],
+           trend_per_decade = round(10 * slope, 1))
+```
+
+## Distribution of flow
+
+```{r eda-distribution}
+## Mean well above median, max ~13x median: strongly right-skewed.  This is why
+## the extremes are modelled separately (POT + GPD) rather than fitting one
+## distribution to all 1.2 million readings.
+q <- quantile(flow$value, c(0.5, 0.9, 0.95, 0.99, 1), na.rm = TRUE)
+data.frame(statistic = c("mean", "median", "90%", "95%", "99%", "max"),
+           flow_m3s = round(c(mean(flow$value, na.rm = TRUE), q), 1))
+par(mfrow = c(1, 2))
+hist(flow$value, breaks = 100, col = "grey80", border = NA,
+     main = "All 15-minute readings", xlab = expression("Flow (m"^3*"/s)"))
+hist(log10(flow$value[flow$value > 0]), breaks = 100, col = "grey80", border = NA,
+     main = "Same, log10 scale", xlab = expression("log"[10]*" flow"))
+par(mfrow = c(1, 1))
+```
+
+# Event extraction with Peaks Over Threshold
+
+## Threshold scan: events per year
+
+```{r threshold-scan}
+## The rule of thumb is a threshold giving 3-5 independent events per year.
+## Every row runs the full Robson & Reed filter, so the rate already accounts
+## for declustering (which is why it is lower than a count of exceedances).
+u_grid <- seq(40, 120, by = 10)
+scan <- do.call(rbind, lapply(u_grid, function(uu) {
+  r <- extract_events(flow, uu, sep_factor, trough_frac, start_rule, win_h = win_h)
+  data.frame(u = uu, candidates = r$n_candidates, events = nrow(r$events),
+             events_per_year = round(r$rate, 2),
+             mean_time_to_rise_h = round(r$settings$T_rise_h),
+             min_separation_days = round(r$settings$min_sep_h / 24, 1))
+}))
+scan
+plot(scan$u, scan$events_per_year, type = "b", pch = 19,
+     xlab = expression("Threshold u (m"^3*"/s)"), ylab = "Independent events per year",
+     main = "Threshold scan after Robson & Reed declustering")
+abline(h = c(3, 5), lty = 3); abline(v = u, lty = 2, col = "firebrick")
+```
+
+## Extract the events at the chosen threshold
+
+```{r extract}
+## extract_events() does, in order (see pot_functions.R for the detail):
+##   1. candidate peaks: maximum of each run of flow_smooth > u
+##   2. mean time to rise T_r from clean peaks >= 7 days apart (first pass)
+##   3. Robson & Reed: adjacent peaks independent only if >= 3 T_r apart AND the
+##      trough between them is < 1/3 of the first peak; otherwise drop the smaller
+##   4. start of peak: last daily-scale trough (lowest within +/- win_h) before the peak
+##   5. end: next trough, or when flow recedes to the start level
+##   6. peak time = max of the 3 h-smoothed series; q_peak = highest RECORDED
+##      reading within 3 h of it; time to peak =
+##      t_peak - t_start; counts of Suspect / unfilled-gap readings in the rise;
+##      clean = no unfilled gap within a day of the start or the peak
+ex     <- extract_events(flow, u, sep_factor, trough_frac, start_rule, win_h = win_h)
+events <- ex$events
+events$time_to_peak_d <- events$time_to_peak_h / 24
+lambda <- ex$rate                                   # events per year
+
+data.frame(threshold = u, candidates = ex$n_candidates,
+           removed_time_rule = ex$removed["time"], removed_trough_rule = ex$removed["trough"],
+           events = nrow(events), events_per_year = round(lambda, 2),
+           mean_time_to_rise_h = round(ex$settings$T_rise_h), min_separation_days = round(ex$settings$min_sep_h / 24, 1),
+           events_near_unfilled_gap = sum(!events$clean), peaks_flagged_suspect = sum(events$peak_flag == "Suspect"),
+           row.names = NULL)
+```
+
+```{r event-table}
+## The event table (first rows).  Full table saved in Section 10.
+show_cols <- c("event_id", "t_start", "t_peak", "q_start", "q_peak", "time_to_peak_d",
+               "hydro_year", "season", "n_suspect", "n_missing", "peak_flag")
+ev_show <- events[, show_cols]
+ev_show$q_start <- round(ev_show$q_start, 1); ev_show$q_peak <- round(ev_show$q_peak, 1)
+ev_show$time_to_peak_d <- round(ev_show$time_to_peak_d, 1)
+head(ev_show[order(-ev_show$q_peak), ], 10)
+```
+
+## Figure: the events on the full record
+
+```{r fig-events}
+plot(daily_max$day, daily_max$value, type = "l", lwd = 0.6, col = "grey50",
+     xlab = "", ylab = expression("Daily max flow (m"^3*"/s)"),
+     main = paste0("Independent POT events at u = ", u, " m3/s (", nrow(events), " events, ",
+                   round(lambda, 1), " per year)"))
+abline(h = u, lty = 2, col = "firebrick")
+points(as.Date(events$t_peak), events$q_peak, pch = 19, cex = 0.7,
+       col = ifelse(events$peak_flag == "Suspect", "darkorange", "steelblue"))
+legend("topright", bty = "n", pch = 19, col = c("steelblue", "darkorange"),
+       legend = c("event peak", "peak reading flagged Suspect"), cex = 0.8)
+```
+
+## Figure: example events with start, peak and end marked
+
+```{r fig-examples, fig.height = 7}
+## Four events: the largest, the median, a short-rise and a long-rise event, so
+## the reader sees exactly what was measured.
+pick <- c(which.max(events$q_peak),
+          which.min(abs(events$q_peak - median(events$q_peak))),
+          which.min(events$time_to_peak_h[events$clean]),
+          which.max(events$time_to_peak_h))
+pick <- unique(pick)
+par(mfrow = c(2, 2), mar = c(4, 4.5, 3, 1))
+for (i in pick) {
+  e   <- events[i, ]
+  idx <- max(1, e$i_start - 4 * per_day):min(nrow(flow), e$i_end + 4 * per_day)
+  plot(flow$dateTime[idx], flow$value[idx], type = "l", col = "grey40",
+       xlab = "", ylab = expression("Flow (m"^3*"/s)"),
+       main = sprintf("Event %d: peak %.0f m3/s, time to peak %.1f days",
+                      e$event_id, e$q_peak, e$time_to_peak_d), cex.main = 0.95)
+  lines(flow$dateTime[idx], flow$flow_day[idx], col = "firebrick", lty = 2)
+  abline(h = u, lty = 3)
+  abline(v = c(e$t_start, e$t_peak, e$t_end), col = c("darkgreen", "steelblue", "purple"), lwd = 1.5)
+  legend("topleft", bty = "n", cex = 0.75, lwd = 1.5, col = c("darkgreen", "steelblue", "purple"),
+         legend = c("start (last trough)", "peak", "end"))
+}
+par(mfrow = c(1, 1))
+```
+
+# Max flow: GPD model
+
+## Threshold diagnostics
+
+```{r gpd-diagnostics-threshold}
+## MRL and parameter-stability plots must be computed on INDEPENDENT peaks, not
+## on 1.2 million autocorrelated 15-minute readings.  We decluster at a lower
+## threshold u_low so the plots cover a range of candidate thresholds, and check
+## that the chosen u lies where the mean excess is roughly linear and the
+## parameter estimates are stable.
+ex_low <- extract_events(flow, u_low, sep_factor, trough_frac, start_rule, win_h = win_h)
+x_low  <- ex_low$events$q_peak
+mrl.plot(x_low, umin = u_low, umax = quantile(x_low, 0.95))
+title(main = "Mean residual life plot of declustered event peaks"); abline(v = u, lty = 2, col = "firebrick")
+```
+
+```{r gpd-diagnostics-stability, fig.height = 7}
+## Parameter stability: the modified scale sigma* = sigma_u - xi*u and the shape
+## should be constant (within error bars) above a valid threshold.
+gpd.fitrange(x_low, umin = u_low, umax = 120, nint = 9)
+```
+
+## Fit the GPD to event peaks above u
+
+```{r gpd-fit}
+## Model: excesses Y = X - u of the event peaks are Generalised Pareto,
+##   P(Y <= y) = 1 - (1 + xi*y/sigma)^(-1/xi),   y > 0,  1 + xi*y/sigma > 0
+## fitted by maximum likelihood to the declustered event peaks only.
+## A negative xi means a bounded upper tail with endpoint u + sigma/|xi|.
+x    <- events$q_peak
+fit  <- gpd.fit(x, u, show = FALSE)
+gpd_par <- data.frame(parameter = c("sigma (scale)", "xi (shape)"),
+                      estimate = round(fit$mle, 3), std_error = round(fit$se, 3),
+                      ci_lower = round(fit$mle - 1.96 * fit$se, 3),
+                      ci_upper = round(fit$mle + 1.96 * fit$se, 3))
+gpd_par
+cat("Excesses used:", fit$nexc, "   event rate lambda:", round(lambda, 2), "per year\n")
+if (fit$mle[2] < 0) cat("Implied upper endpoint:", round(u + fit$mle[1] / abs(fit$mle[2])), "m3/s\n")
+```
+
+```{r gpd-diag, fig.height = 7}
+## Probability and quantile plots should hug the diagonal; the return-level plot
+## shows the fitted curve against the empirical points with 95% bands.
+## ismev::gpd.diag(fit) draws all four, but its density panel errors for a
+## bounded-tail (xi < 0) fit, so the same three ismev panels are called
+## individually and the density panel is drawn by hand.
+par(mfrow = c(2, 2), mar = c(4, 4.5, 3, 1))
+ismev:::gpd.pp(fit$mle, fit$threshold, fit$data)
+ismev:::gpd.qq(fit$mle, fit$threshold, fit$data)
+ismev:::gpd.rl(fit$mle, fit$threshold, fit$rate, fit$n, fit$npy, fit$cov, fit$data, fit$xdata)
+hist(x, breaks = 15, freq = FALSE, col = "grey85", border = NA,
+     xlab = expression("Event max flow (m"^3*"/s)"), main = "Density Plot")
+sig <- fit$mle[1]; xi <- fit$mle[2]
+xx  <- seq(u, max(x) * 1.05, length.out = 200)
+dens <- (1 / sig) * pmax(1 + xi * (xx - u) / sig, 0)^(-1 / xi - 1)
+lines(xx, dens, col = "steelblue", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+## Return levels
+
+```{r return-levels}
+## m-year return level:  x_m = u + (sigma/xi) * ((m * lambda)^xi - 1)
+## 95% intervals by the delta method using the MLE covariance matrix.
+rl <- as.data.frame(gpd_return_level(fit, u, lambda, ret_periods))
+rl[] <- lapply(rl, round, 0)
+names(rl) <- c("return_period_years", "flow_m3s", "ci_lower", "ci_upper")
+rl
+
+## Empirical comparison: the largest observed peaks and their plotting-position
+## return periods T = (n + 1) / (rank * lambda) ... expressed in years.
+n_ev <- length(x)
+emp  <- data.frame(flow = sort(x, decreasing = TRUE)[1:5],
+                   empirical_return_period_years = round((n_ev + 1) / (1:5) / lambda, 1))
+emp
+```
+
+## Max flow: descriptive view
+
+```{r maxflow-descriptive}
+par(mfrow = c(1, 2))
+hist(x, breaks = 15, col = "grey80", border = NA, xlab = expression("Event max flow (m"^3*"/s)"),
+     main = "Max flow of independent events")
+plot(events$t_peak, x, pch = 19, cex = 0.7, xlab = "", ylab = expression("Event max flow (m"^3*"/s)"),
+     main = "Event max flow over time")
+abline(h = u, lty = 2)
+par(mfrow = c(1, 1))
+data.frame(n = n_ev, median = round(median(x), 1), IQR = round(IQR(x), 1),
+           q90 = round(quantile(x, 0.9), 1), max = round(max(x), 1))
+```
+
+# Time to peak and joint behaviour
+
+```{r ttp-distribution}
+## Time to peak uses only CLEAN events: no unfilled gap (> 4 h) within a day of
+## the start or of the peak, because such a gap makes either time unreliable.
+ev_c <- events[events$clean, ]
+tp   <- ev_c$time_to_peak_d
+cat("Clean events:", nrow(ev_c), "of", nrow(events), "\n")
+
+## Lognormal and gamma fits by maximum likelihood; both are right-skewed,
+## positive-valued families.  Compare by log-likelihood and a QQ plot.
+f_ln <- fitdistr(tp, "lognormal")
+f_ga <- fitdistr(tp, "gamma", lower = c(1e-3, 1e-3))
+ttp_fits <- data.frame(
+  distribution = c("lognormal", "gamma"),
+  par1 = round(c(f_ln$estimate["meanlog"], f_ga$estimate["shape"]), 3),
+  par2 = round(c(f_ln$estimate["sdlog"],   f_ga$estimate["rate"]),  3),
+  loglik = round(c(f_ln$loglik, f_ga$loglik), 1),
+  fitted_median_days = round(c(exp(f_ln$estimate["meanlog"]),
+                               qgamma(0.5, f_ga$estimate["shape"], f_ga$estimate["rate"])), 2))
+ttp_fits
+
+par(mfrow = c(1, 3))
+hist(tp, breaks = 15, freq = FALSE, col = "grey80", border = NA,
+     xlab = "Time to peak (days)", main = "Time to peak, clean events")
+curve(dlnorm(x, f_ln$estimate[1], f_ln$estimate[2]), add = TRUE, col = "steelblue", lwd = 2)
+curve(dgamma(x, f_ga$estimate[1], f_ga$estimate[2]), add = TRUE, col = "firebrick", lwd = 2, lty = 2)
+legend("topright", bty = "n", lwd = 2, lty = 1:2, col = c("steelblue", "firebrick"), legend = c("lognormal", "gamma"))
+plot(ecdf(tp), main = "Empirical CDF", xlab = "Time to peak (days)", ylab = "Proportion of events")
+pp <- ppoints(length(tp))
+plot(qlnorm(pp, f_ln$estimate[1], f_ln$estimate[2]), sort(tp), pch = 19, cex = 0.7,
+     xlab = "Lognormal quantiles (days)", ylab = "Observed (days)", main = "QQ plot, lognormal")
+abline(0, 1, lty = 2)
+par(mfrow = c(1, 1))
+
+data.frame(n = length(tp), median_days = round(median(tp), 2), IQR_days = round(IQR(tp), 2),
+           q10 = round(quantile(tp, .1), 2), q90 = round(quantile(tp, .9), 2),
+           min = round(min(tp), 2), max = round(max(tp), 2))
+```
+
+## Joint behaviour: do bigger floods rise faster or slower?
+
+```{r joint}
+rho  <- cor.test(ev_c$q_peak, ev_c$time_to_peak_d, method = "spearman", exact = FALSE)
+## Bootstrap 95% CI for Spearman's rho (resample events).
+boot <- replicate(2000, { i <- sample(nrow(ev_c), replace = TRUE)
+                          cor(ev_c$q_peak[i], ev_c$time_to_peak_d[i], method = "spearman") })
+plot(ev_c$q_peak, ev_c$time_to_peak_d, pch = 19, cex = 0.8,
+     col = ifelse(grepl("winter", ev_c$season), "steelblue", "darkorange"),
+     xlab = expression("Event max flow (m"^3*"/s)"), ylab = "Time to peak (days)",
+     main = sprintf("Time to peak vs max flow: Spearman rho = %.2f (95%% CI %.2f to %.2f)",
+                    rho$estimate, quantile(boot, .025), quantile(boot, .975)))
+legend("topleft", bty = "n", pch = 19, col = c("steelblue", "darkorange"), legend = c("winter", "summer"))
+data.frame(spearman_rho = round(rho$estimate, 3), p_value = signif(rho$p.value, 2),
+           boot_ci_lower = round(quantile(boot, .025), 3), boot_ci_upper = round(quantile(boot, .975), 3))
+```
+
+## Seasonality of both summaries
+
+```{r seasonal}
+## Summer events are few, so this is descriptive; the Wilcoxon test is a check,
+## not a headline.
+seas <- do.call(rbind, lapply(split(ev_c, ev_c$season), function(d) data.frame(
+  season = d$season[1], n = nrow(d),
+  max_flow_median = round(median(d$q_peak), 1), max_flow_IQR = round(IQR(d$q_peak), 1),
+  ttp_median_days = round(median(d$time_to_peak_d), 2), ttp_IQR_days = round(IQR(d$time_to_peak_d), 2))))
+rownames(seas) <- NULL
+seas
+w1 <- wilcox.test(q_peak ~ season, data = ev_c)$p.value
+w2 <- wilcox.test(time_to_peak_d ~ season, data = ev_c)$p.value
+data.frame(test = c("max flow, winter vs summer", "time to peak, winter vs summer"),
+           wilcoxon_p = signif(c(w1, w2), 2))
+```
+
+# Sensitivity analysis
+
+```{r sensitivity, eval = run_sensitivity}
+## One table: rerun the whole pipeline for each alternative choice and report the
+## headline numbers.  Because everything flows through extract_events(), each
+## row is one function call.
+headline <- function(ex, label) {
+  e  <- ex$events; ec <- e[e$clean, ]
+  f  <- gpd.fit(e$q_peak, ex$settings$u, show = FALSE)
+  r100 <- gpd_return_level(f, ex$settings$u, ex$rate, 100)
+  data.frame(variant = label, u = ex$settings$u, events = nrow(e), per_year = round(ex$rate, 2),
+             maxflow_median = round(median(e$q_peak)), maxflow_IQR = round(IQR(e$q_peak)),
+             ttp_median_d = round(median(ec$time_to_peak_d), 2), ttp_IQR_d = round(IQR(ec$time_to_peak_d), 2),
+             xi = round(f$mle[2], 2), RL100 = round(r100[1, "level"]),
+             RL100_lower = round(r100[1, "lower"]), RL100_upper = round(r100[1, "upper"]))
+}
+tidy <- function(ex) { ex$events$time_to_peak_d <- ex$events$time_to_peak_h / 24; ex }
+variants <- list(
+  list("baseline (u=60, R&R, trough 48 h, keep Suspect)", list()),
+  list("threshold: ~3 events/yr (u=70)",            list(u = 70)),
+  list("threshold: ~4 events/yr (u=50)",            list(u = 50)),
+  list("independence: fixed 7-day separation",      list(fixed_sep_h = 7 * 24)),
+  list("independence: fixed 14-day separation",     list(fixed_sep_h = 14 * 24)),
+  list("start of peak: trough window 24 h",         list(win_h = 24)),
+  list("start of peak: trough window 72 h",         list(win_h = 72)),
+  list("start of peak: onset of sustained rise",    list(start_rule = "rise")),
+  list("data quality: Suspect readings removed",    list(drop_suspect = TRUE)))
+sens <- do.call(rbind, lapply(variants, function(v) {
+  args <- modifyList(list(df = flow, u = u, sep_factor = sep_factor, trough_frac = trough_frac,
+                          start_rule = start_rule, win_h = win_h), v[[2]])
+  headline(tidy(do.call(extract_events, args)), v[[1]])
+}))
+rownames(sens) <- NULL
+sens
+```
+
+# Save outputs for Part 2
+
+```{r save}
+## Event table and the full hydrograph of every event (flow_clean.rds was saved in Section 4).
+saveRDS(events,     "events.rds")
+saveRDS(event_hydrographs(flow, events), "event_hydrographs.rds")
+write.csv(ev_show, "event_table.csv", row.names = FALSE)
+cat("Saved events.rds, event_hydrographs.rds, event_table.csv\n")
+```
+
+```{r session-info}
+sessionInfo()
+```
