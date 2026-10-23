@@ -44,7 +44,8 @@ points(dates[missing], rep(-50, sum(missing)),
 
 View(Reading_flow_15min_Qualified)
 
-
+### Plottin original graph with NAs
+  
 dates <- as.POSIXct(flow_data$dateTime)
 missing <- is.na(flow_data$value)
 
@@ -60,3 +61,12 @@ axis(1, at = ticks, labels = format(ticks, "%Y"))
 
 points(dates[missing], rep(-50, sum(missing)),
        col = "red", pch = 16, cex = 0.3)
+
+# NAs before 1 January 2005
+NAs_sum_pre2005 <- sum(missing & dates < as.POSIXct("2005-01-01"), na.rm = TRUE)
+
+# NAs overall
+total_NAs <- sum(missing)
+(NAs_sum_pre2005 / total_NAs) * 100
+
+
