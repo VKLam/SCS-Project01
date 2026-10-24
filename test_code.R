@@ -302,147 +302,189 @@ ggplot(flow_data_2005, aes(dateTime, flow_filled)) +
 
 
 
-#################### Peaks over threshold ####################
+################# POT#######################
 
+u <- 148
 dat <- flow_data_2005
 
-find_events <- function(dat, u, separation_days = 3) {
+# Fill gaps of up to four missing readings
+dat$flow_filled <- zoo::na.approx(
+  dat$value,
+  x = as.numeric(dat$dateTime),
+  maxgap = 4,
+  na.rm = FALSE
+)
+
+flow <- dat$flow_filled
+dates <- dat$dateTime
+
+events <- data.frame(
+  start_time = as.POSIXct(character()),
+  end_time = as.POSIXct(character()),
+  peak_time = as.POSIXct(character()),
+  max_flow = numeric()
+)
+
+in_event <- FALSE
+ready <- FALSE
+discarded <- 0
+
+for (i in seq_along(flow)) {
   
-  flow <- dat$flow_filled
-  dates <- dat$dateTime
-  
-  # Find runs above u
-  above <- !is.na(flow) & flow > u
-  runs <- rle(above)
-  
-  ends <- cumsum(runs$lengths)
-  starts <- ends - runs$lengths + 1
-  
-  starts <- starts[runs$values]
-  ends <- ends[runs$values]
-  
-  if (length(starts) == 0) return(data.frame())
-  
-  # Flag runs touching missing data or the record boundary
-  padded <- c(NA, flow, NA)
-  
-  uncertain <- is.na(padded[starts]) |
-    is.na(padded[ends + 2])
-  
-  group <- integer(length(starts))
-  group[1] <- 1
-  
-  # Decide whether neighbouring runs belong to the same flood
-  if (length(starts) > 1) {
-    for (i in 2:length(starts)) {
+  if (is.na(flow[i])) {
+    
+    # A gap left after interpolation interrupts the event
+    if (in_event) {
+      discarded <- discarded + 1
+    }
+    
+    in_event <- FALSE
+    ready <- FALSE
+    
+  } else if (flow[i] <= u) {
+    
+    # The event finishes when flow returns to u or below
+    if (in_event) {
       
-      between <- seq.int(ends[i - 1] + 1, starts[i] - 1)
+      events[nrow(events) + 1, ] <- list(
+        dates[start],
+        dates[i],
+        dates[peak],
+        flow[peak]
+      )
+    }
+    
+    in_event <- FALSE
+    ready <- TRUE
+    
+  } else {
+    
+    # Start an event only after observing flow at/below u
+    if (!in_event && ready) {
+      start <- i
+      peak <- i
+      in_event <- TRUE
+    }
+    
+    if (in_event && flow[i] > flow[peak]) {
+      peak <- i
+    }
+  }
+}
+
+# An event still open at the end is incomplete
+incomplete_at_end <- in_event
+
+# Results
+nrow(events)
+discarded
+incomplete_at_end
+
+View(events)
+
+
+# Approximate observed years and event rate
+observed_years <- sum(!is.na(flow)) / (96 * 365.25)
+
+data.frame(
+  threshold = u,
+  events_counted = nrow(events),
+  events_interrupted_by_gaps = discarded,
+  observed_years = observed_years,
+  events_per_year = nrow(events) / observed_years,
+  minimum_for_3_per_year = ceiling(3 * observed_years),
+  maximum_for_5_per_year = floor(5 * observed_years)
+)
+
+
+###
+
+
+flow <- flow_data_2005$flow_filled
+
+# Observation time, excluding remaining NAs
+observed_years <- sum(!is.na(flow)) / (96 * 365.25)
+
+
+
+
+get_runs <- function(flow, u) {
+  
+  events <- data.frame(
+    start = integer(),
+    end = integer(),
+    peak = integer()
+  )
+  
+  ready <- FALSE
+  in_event <- FALSE
+  
+  for (i in seq_along(flow)) {
+    
+    if (is.na(flow[i])) {
       
-      if (anyNA(flow[between])) {
+      # Discard an interrupted event
+      ready <- FALSE
+      in_event <- FALSE
+      
+    } else if (flow[i] <= u) {
+      
+      # Finish the event
+      if (in_event) {
+        rows <- start:(i - 1)
+        peak <- rows[which.max(flow[rows])]
         
-        # Don't join across an unresolved gap
-        uncertain[c(i - 1, i)] <- TRUE
-        separate <- TRUE
-        
-      } else {
-        
-        days_below <- length(between) / 96
-        
-        separate <- days_below >= separation_days &&
-          min(flow[between]) <= 0.75 * u
+        events[nrow(events) + 1, ] <- list(
+          start, i - 1, peak
+        )
       }
       
-      group[i] <- group[i - 1] + as.integer(separate)
+      ready <- TRUE
+      in_event <- FALSE
+      
+    } else if (ready && !in_event) {
+      
+      # Start a run above u
+      start <- i
+      in_event <- TRUE
     }
   }
   
-  # Keep one maximum for each event
-  events <- lapply(split(seq_along(starts), group), function(g) {
-    
-    first <- starts[min(g)]
-    last <- ends[max(g)]
-    rows <- first:last
-    peak <- rows[which.max(flow[rows])]
-    
-    data.frame(
-      first_above = dates[first],
-      last_above = dates[last],
-      peak_time = dates[peak],
-      max_flow = flow[peak],
-      n_interpolated = sum(dat$interpolated[rows]),
-      uncertain = any(uncertain[g])
-    )
-  })
-  
-  events <- do.call(rbind, events)
-  rownames(events) <- NULL
   events
 }
 
+thresholds <- seq(40, 200, by = 1)
 
-# Observation time, excluding NAs left after interpolation
-observed_years <- sum(!is.na(dat$flow_filled)) /
-  (96 * 365.25)
-
-# Try thresholds from 40 to 200
-thresholds <- seq(40, 200, by = 5)
-
-pot_results <- do.call(rbind, lapply(thresholds, function(u) {
-  
-  events <- find_events(dat, u)
-  
-  if (nrow(events) == 0) {
-    retained <- 0
-    flagged <- 0
-  } else {
-    retained <- sum(!events$uncertain)
-    flagged <- sum(events$uncertain)
-  }
-  
-  data.frame(
-    threshold = u,
-    retained_events = retained,
-    flagged_events = flagged,
-    events_per_year = retained / observed_years
-  )
-}))
-
-print(pot_results)
-
-
-# Plot event rate against threshold
-ggplot(pot_results, aes(threshold, events_per_year)) +
-  geom_line() +
-  geom_point() +
-  geom_hline(yintercept = c(3, 5),
-             colour = "red", linetype = "dashed") +
-  labs(x = "Flow threshold",
-       y = "Retained events per observed year") +
-  theme_minimal()
-
-
-# Thresholds giving 3–5 events per year
-suitable <- subset(
-  pot_results,
-  events_per_year >= 3 & events_per_year <= 5
+results <- data.frame(
+  threshold = thresholds,
+  number_of_events = integer(length(thresholds))
 )
 
-print(suitable)
-
-
-# For now, try the threshold giving a rate closest to four
-if (nrow(suitable) > 0) {
+for (i in seq_along(thresholds)) {
   
-  chosen_u <- suitable$threshold[
-    which.min(abs(suitable$events_per_year - 4))
-  ]
+  events <- get_runs(flow, u = thresholds[i])
   
-  events <- find_events(dat, chosen_u)
-  retained_events <- subset(events, !uncertain)
-  
-  print(chosen_u)
-  View(retained_events)
-  
-} else {
-  message("No suitable threshold found. Try a wider threshold range.")
+  results$number_of_events[i] <- nrow(events)
 }
+
+results$events_per_year <-
+  results$number_of_events / observed_years
+
+View(results)
+print(results)
+
+ggplot(results, aes(threshold, events_per_year)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(
+    yintercept = c(3, 5),
+    colour = "red",
+    linetype = "dashed"
+  ) +
+  labs(
+    x = "Flow threshold",
+    y = "Events per observed year"
+  ) +
+  theme_minimal()
+
+subset(results, events_per_year >= 3 & events_per_year <= 5)
